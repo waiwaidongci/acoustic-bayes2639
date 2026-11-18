@@ -12,8 +12,9 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释。为桐弦研究�
 2. 声检批次：创建/修改来源说明、查看样本、用真实业务字段追加记录；列表分页。
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
-5. 复检批注：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+5. 联邦汇总：各检修站只上报按故障类型的样本数/均值/离均差平方和，分片带版本补报，封轮合并后发布判读模型。
+6. 复检批注：分析师草案→负责人批准→阅读者下载批准快照。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准、联邦建轮到发布等事件。
 
 ## 快速启动
 
@@ -53,9 +54,21 @@ JWT有效期8小时；PBKDF2盐化哈希保存密码；角色每请求从数据�
 
 ## 实体与字段
 
-AcousticBatch / AcousticSample / ClassifierRun / InspectionNote 是核心实体；另有User和Audit。数据库实际表：`acoustic_batches` → `acoustic_samples` → `classifier_runs` → `inspection_notes`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：均方根振幅（`rms`）、频谱质心 Hz（`centroid`）、峭度（`kurtosis`）、复核类型（`label`）。
+AcousticBatch / AcousticSample / ClassifierRun / InspectionNote 是核心实体；另有User和Audit。数据库实际表：`acoustic_batches` → `acoustic_samples` → `classifier_runs` → `inspection_notes`；联邦汇总另有 `fed_rounds` → `fed_contributions` → `fed_merges` → `fed_models`（见“联邦汇总训练”）。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：均方根振幅（`rms`）、频谱质心 Hz（`centroid`）、峭度（`kurtosis`）、复核类型（`label`）。
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
+
+## 联邦汇总训练
+
+各检修站不便外传原始声检样本。每轮冻结参与站点与特征口径；各站按故障类型上报每个特征的样本数 `n`、均值 `mean`、离均差平方和 `m2`，中心用 Chan 并行合并算法得到全局类条件均值/方差与类先验，再按全局标准化口径建立 GaussianNB 判读模型——后验与把各站原始样本合并后训练 `StandardScaler+GaussianNB` 完全一致（oracle 误差 <1e-9）。大偏移（如 1e8）而方差很小（如 1e-4）时，合并统计量仍达 float64 精度极限，后验在对数空间计算不溢出。
+
+- 分片带版本补报：同一 `(站点,分片)` 更高版本替换旧贡献（旧版本留痕 superseded）；同版同内容重试幂等不重复计权；同版改写与旧版本拒收；不同分片覆盖区间重叠拒收；分片样本数须与覆盖区间一致。
+- 封轮不混版：封轮把当前已接收贡献与判读批次快照为一份清单（manifest, epoch），独立 worker 只按清单合并；期间新补报推进 epoch，基于旧 epoch 的合并结果发布时被拒（晚到旧计算拒绝发布），重新封轮即可。
+- 发布门槛：全部冻结站点贡献齐备且判读结果齐备，负责人才能发布；缺站期间，临时判读继续使用最近一次已发布模型。
+- 中断恢复：贡献落库不丢；worker 启动时把卡在 queued/running 的合并重新入队，同一分片重试不会重复增加权重。
+- 页面可追查每轮缺站、已接收分片@版本、每次封轮合并记录，以及发布模型实际采用的贡献清单与 SHA256。
+
+相关表：`fed_rounds`（冻结站点/特征口径/epoch）→ `fed_contributions`（分片版本，唯一键 `(round_id,station,shard,version)`）→ `fed_merges`（封轮清单与合并结果）→ `fed_models`（发布快照）。路由前缀 `/federation/*`；建轮/上报/封轮需 analyst 或 admin，发布需 admin。`POST /federation/preview-stats` 是站点侧计算工具（演示中以既有批次充当站点本地数据）；`POST /federation/interpret` 用当前已发布模型临时判读一个批次。
 
 ## 算法与口径
 
@@ -72,7 +85,7 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释，全部计算位�
 
 ## 演示数据与一天剧本
 
-固定seed=42，3个来源 ` TX-202611-01/02/03`，每来源240条，共720条业务记录；三个账号和首轮种子任务。自然键检查后仅插入缺失数据，连跑seed不重复、不覆盖用户修改。`SEED_DEMO=true` 时启动自动执行；失败记录日志但不阻塞服务。首轮任务同样由独立worker真实计算。
+固定seed=42，3个来源 ` TX-202611-01/02/03`，每来源240条，共720条业务记录；三个账号和首轮种子任务。联邦侧同样种子化：「十一月三站联合建模」三轮次三站齐备并已发布（720条汇总样本），「十二月补报轮」缺山南检修站、停留在汇总中，用于演示缺站追查与沿用已发布模型。自然键检查后仅插入缺失数据，连跑seed不重复、不覆盖用户修改。`SEED_DEMO=true` 时启动自动执行；失败记录日志但不阻塞服务。首轮任务同样由独立worker真实计算。
 
 1. 09:00 负责人查看三份来源和720条样本。
 2. 09:10 分析师选择 `TX-202611-01 秋季常规组`，核对 `acoustic-bayes-202611-01.csv`。
@@ -103,6 +116,6 @@ backend/migrations/001_initial.sql
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
 
-共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
+共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved，以及联邦的 collecting/published、accepted/superseded、queued/running/computed/failed。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置、联邦与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
-测试及截图在批根 `test-artifacts/gb-0041/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+测试及截图在批根 `test-artifacts/gb-0041/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`；`test_federation.py` 覆盖联邦oracle一致性（含1e8大偏移小方差）、分片版本语义、封轮/发布并发、中断恢复与原研究回归，共41项检查。License：MIT。

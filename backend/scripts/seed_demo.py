@@ -6,11 +6,14 @@ from src.models.user import User
 from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
-from src.models import note,audit
+from src.models import note,audit,federation as federation_models
+from src.models.federation import FedRound
 from src.utils.security import hash_password
 from src.utils.serialization import now
 from src.services.runs import queue
 from src.services.domain_validation import validate_record
+from src.services import federation
+from src.schemas.federation import RoundInput,ContributionInput
 
 def seed_values(kind,index,batch,rng):
     if kind=='gaussian':
@@ -30,6 +33,24 @@ def seed_values(kind,index,batch,rng):
         uid=index//6;slot=index%6;exhibit=(uid%3*3+slot)%12
         return {'visitor':f'V{uid+1:03}','exhibit':f'E{exhibit+1:02}','rating':round(max(1,min(5,3+(1 if exhibit%3==uid%3 else -.4)+rng.gauss(0,.55))),1)}
 
+def seed_federation(db,sources):
+    stations=['北郊检修站','临港检修站','山南检修站']
+    features=[f for f,_,kind in CONFIG['fields'] if kind=='number']
+    def stats_of(source):
+        records=[{'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
+        return federation.local_stats(records,features),len(records)
+    def contribute(round_id,station,source,shard):
+        stats,n=stats_of(source)
+        federation.submit_contribution(db,'seed',round_id,ContributionInput(station=station,shard=shard,version=1,coverage=[0,n],stats=stats))
+    if not db.scalar(select(FedRound.id).where(FedRound.name=='十一月三站联合建模')):
+        r=federation.create_round(db,'seed',RoundInput(name='十一月三站联合建模',stations=stations,interpret_source_ids=[sources[0].id]))
+        for station,source in zip(stations,sources):contribute(r['id'],station,source,'full-202611')
+        m=federation.seal_round(db,'seed',r['id'],enqueue=False)
+        federation.run_merge(db,m['id'])
+        federation.publish_round(db,'seed',r['id'])
+    if not db.scalar(select(FedRound.id).where(FedRound.name=='十二月补报轮')):
+        r=federation.create_round(db,'seed',RoundInput(name='十二月补报轮',stations=stations,interpret_source_ids=[sources[0].id]))
+        for station,source in zip(stations[:2],sources[:2]):contribute(r['id'],station,source,'full-202612')
 def counts(db):
     return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in (User,Source,Record,Run)}
 def seed():
@@ -53,6 +74,8 @@ def seed():
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
+        sources=[db.scalar(select(Source).where(Source.key==CONFIG['code']+f'-202611-{b+1:02}')) for b in range(3)]
+        if all(sources):seed_federation(db,sources)
     for id in queued:
         try:queue.rpush('analysis:queue',id)
         except Exception:logging.exception('seed queue unavailable')
